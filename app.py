@@ -985,46 +985,77 @@ def get_station(station_id):
 @app.route('/api/charging/start', methods=['POST'])
 @token_required
 def start_charging():
-    """Start a charging session"""
+    """Start charging session via OCPP"""
     data = request.get_json()
     station_id = data.get('station_id')
     connector_id = data.get('connector_id', 1)
-    
+    id_token = data.get('id_token')  # Allow override from request
+
     if not station_id:
         return jsonify({'error': 'station_id required'}), 400
-    
+
+    # Get user's RFID token from database
+    user = User.query.get(request.user_id)
+    if not user:
+        return jsonify({'error': 'User not found'}), 404
+
+    # Use provided token, or fall back to user's RFID
+    token_value = id_token or user.rfid_token
+
     # Create local session record
-    session = ChargingSession(
+    charging_session = ChargingSession(
         user_id=request.user_id,
         station_id=station_id,
         connector_id=connector_id,
         start_time=datetime.utcnow(),
         status='active'
     )
-    db.session.add(session)
+    db.session.add(charging_session)
     db.session.commit()
-    
-    # Try to send command to CitrineOS
+
     try:
-        response = requests.post(
-            f"{CITRINE_API}/ocpp/remoteStart",
-            json={
+        # Determine API call based on station type
+        if station_id.startswith('cp') or station_id.startswith('CP0') == False:
+            # OCPP 2.0.1 station (cp002)
+            payload = {
+                'stationId': station_id,
+                'idToken': {
+                    'idToken': token_value,
+                    'type': 'ISO14443'
+                },
+                'evseId': connector_id
+            }
+        else:
+            # OCPP 1.6 station (CP001)
+            payload = {
                 'stationId': station_id,
                 'connectorId': connector_id,
-                'idToken': str(request.user_id)
+                'idTag': token_value
+            }
+
+        response = requests.post(
+            f"{CITRINE_API}/data/monitoring/remoteStart",
+            json=payload,
+            headers={
+                'Content-Type': 'application/json',
+                'x-hasura-admin-secret': HASURA_ADMIN_SECRET
             },
-            headers={'x-hasura-admin-secret': HASURA_ADMIN_SECRET},
             timeout=10
         )
+
         return jsonify({
-            'message': 'Charging session started',
-            'session_id': session.id,
-            'citrine_response': response.json() if response.ok else None
+            'message': 'Charging command sent',
+            'session_id': charging_session.id,
+            'station': station_id,
+            'token_used': token_value,
+            'citrine_status': response.status_code,
+            'citrine_response': response.json() if response.ok else response.text
         })
     except Exception as e:
         return jsonify({
-            'message': 'Charging session started (local only)',
-            'session_id': session.id,
+            'message': 'Charging session created locally',
+            'session_id': charging_session.id,
+            'token_used': token_value,
             'warning': str(e)
         })
 
@@ -1268,11 +1299,11 @@ def init_database():
     
     # Create test users
     test_users = [
-        ('john.doe@example.com', 'password123', 'John Doe', '+380501111111', 'FLAG{idor_user_data_leaked}'),
-        ('jane.smith@example.com', 'qwerty', 'Jane Smith', '+380502222222', 'RFID-USER-000002'),
-        ('bob.wilson@example.com', '123456', 'Bob Wilson', '+380503333333', 'RFID-USER-000003'),
-        ('alice.johnson@example.com', 'alice2024', 'Alice Johnson', '+380504444444', 'RFID-USER-000004'),
-    ]
+    ('john.doe@example.com', 'password123', 'John Doe', '+380501111111', 'DEADBEEF'),
+    ('jane.smith@example.com', 'qwerty', 'Jane Smith', '+380502222222', 'FLAG{idor_user_data_leaked}'),
+    ('bob.wilson@example.com', '123456', 'Bob Wilson', '+380503333333', 'RFID-USER-000003'),
+    ('alice.johnson@example.com', 'alice2024', 'Alice Johnson', '+380504444444', 'RFID-USER-000004'),
+]
     
     for email, password, name, phone, rfid in test_users:
         if not User.query.filter_by(email=email).first():
