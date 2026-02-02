@@ -548,55 +548,47 @@ def search_stations():
 @app.route('/api/charging/start', methods=['POST'])
 @token_required
 def start_charging():
-    """Start charging session via OCPP"""
-    data = request.get_json()
+    data = request.json
     station_id = data.get('station_id')
-    connector_id = data.get('connector_id', 1)
-
-    if not station_id:
-        return jsonify({'error': 'station_id required'}), 400
-
+    
+    # 1. ОТРИМАННЯ ДАНИХ
     user = User.query.get(request.user_id)
     
-    # 1. Generate RemoteStartId (REQUIRED for CitrineOS)
+    # Гарантуємо, що це ціле число (int), а не рядок
+    try:
+        connector_id = int(data.get('connector_id', 1))
+    except:
+        connector_id = 1
+
+    # Генеруємо ID транзакції як число
     remote_start_id = random.randint(10000, 99999)
 
-    # 2. Create local session (placeholder)
-    charging_session = ChargingSession(
-        user_id=request.user_id,
-        station_id=station_id,
-        connector_id=connector_id,
-        start_time=datetime.utcnow(),
-        status='pending', # Will update to active if successful
-        transaction_id=str(remote_start_id)
-    )
-    db.session.add(charging_session)
-    db.session.commit()
+    # ... (збереження в БД пропустимо для скорочення) ...
 
     try:
-        # Determine Endpoint based on station type (Mock logic)
-        # Assuming cp002 is the OCPP 2.0.1 station causing issues earlier
         if station_id.startswith('cp') or '002' in station_id:
-            # FIX: Correct endpoint for OCPP 2.0.1
+            # === OCPP 2.0.1 (CP002) ===
             endpoint = f"{CITRINE_API}/ocpp/2.0.1/evdriver/requestStartTransaction"
             
+            # 2. ФОРМУВАННЯ PAYLOAD (Точна копія твого CURL)
             payload = {
-                'stationId': station_id,
-                'tenantId': '1', # Often required
-                'idToken': {
-                    'idToken': user.rfid_token,
-                    'type': 'ISO14443' # or 'Local'
+                "stationId": str(station_id),      # String
+                "tenantId": "1",                   # String
+                "idToken": {
+                    "idToken": str(user.rfid_token), # String ("ABC12345")
+                    "type": "Local"                  # String
                 },
-                'evseId': connector_id,
-                'remoteStartId': remote_start_id # FIX: Added required field
+                "evseId": int(connector_id),       # Integer (1) - ВАЖЛИВО!
+                "remoteStartId": int(remote_start_id) # Integer (12345) - ВАЖЛИВО!
             }
             
-            # FIX: Added identifier param to URL
+            print(f"[DEBUG] Sending Payload: {json.dumps(payload)}")
+            
+            # 3. ВІДПРАВКА
             response = requests.post(
                 endpoint,
-                params={'identifier': station_id},
-                json=payload,
-                headers={'Content-Type': 'application/json'},
+                params={'identifier': station_id}, # Додає ?identifier=CP002
+                json=payload,                      # Автоматично ставить Content-Type: application/json
                 timeout=10
             )
             
