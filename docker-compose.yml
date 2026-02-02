@@ -1,0 +1,41 @@
+# EcoCharge Web Portal - Docker Compose
+# ============================================================================
+# Сервер: 192.168.125.100
+# Для кіберполігону
+# ============================================================================
+
+version: '3.8'
+
+services:
+  web-portal:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ecocharge-portal
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    environment:
+      - FLASK_ENV=development
+      - FLASK_DEBUG=1
+      - CITRINE_API=http://192.168.20.20:8080
+      - CITRINE_GRAPHQL=http://192.168.20.20:8090/v1/graphql
+    volumes:
+      - portal_data:/app/data
+      - ./app.py:/app/app.py:ro  # For easy updates during CTF
+    networks:
+      - portal_net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:80/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  portal_data:
+    driver: local
+
+networks:
+  portal_net:
+    driver: bridge
