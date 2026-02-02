@@ -719,8 +719,8 @@ def internal_config():
 def init_db():
     db.create_all()
     if not User.query.first():
-        admin = User(email='admin@ecocharge.local', password_hash=hash_password('admin123'), role='admin', rfid_token='RFID-ADMIN')
-        user = User(email='user@example.com', password_hash=hash_password('password'), role='user', rfid_token='RFID-USER')
+        admin = User(email='admin@ecocharge.local', password_hash=hash_password('admin123'), role='admin', rfid_token='ABC12345')
+        user = User(email='user@example.com', password_hash=hash_password('password'), role='user', rfid_token='DEADBEEF')
         db.session.add_all([admin, user])
         
         # Add test stations
