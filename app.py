@@ -319,18 +319,20 @@ def history():
     return jsonify([{'id': s.id, 'station_id': s.station_id, 'status': s.status} for s in sessions])
 
 # =============================================================================
-# HELPER: Get Real Transaction ID from CitrineOS DB
+# HELPER: Get Real Transaction ID from CitrineOS DB (FIXED)
 # =============================================================================
 def get_citrine_transaction_id(station_id):
     """
-    Запитує у CitrineOS через GraphQL реальний transactionId останньої сесії.
+    Запитує у CitrineOS через GraphQL реальний transactionId АКТИВНОЇ сесії.
     """
     try:
+        # УВАГА: Table name is 'Transactions' (Case Sensitive!)
         query = """
-        query GetLastTransaction($stationId: String!) {
-            transactions(
+        query GetActiveTransaction($stationId: String!) {
+            Transactions(
                 where: {
-                    stationId: {_eq: $stationId}
+                    stationId: {_eq: $stationId},
+                    isActive: {_eq: true}
                 }, 
                 order_by: {createdAt: desc}, 
                 limit: 1
@@ -350,11 +352,20 @@ def get_citrine_transaction_id(station_id):
             headers={'x-hasura-admin-secret': HASURA_ADMIN_SECRET},
             timeout=5
         )
+        
         data = response.json()
         print(f"[DEBUG] GraphQL Response: {json.dumps(data)}")
-        transactions = data.get('data', {}).get('transactions', [])
+        
+        # Шукаємо у 'Transactions' (з великої літери)
+        transactions = data.get('data', {}).get('Transactions', [])
+        
         if transactions:
-            return transactions[0]['transactionId']
+            real_id = transactions[0]['transactionId']
+            print(f"[SUCCESS] Found Active Transaction ID: {real_id}")
+            return real_id
+        else:
+            print("[INFO] No active transaction found via GraphQL.")
+            
     except Exception as e:
         print(f"[ERROR] Failed to fetch transaction ID via GraphQL: {e}")
     return None
@@ -449,7 +460,7 @@ def start_charging():
         return jsonify({'error': str(e)}), 500
 
 # =============================================================================
-# STOP CHARGING (FIXED & ROBUST)
+# STOP CHARGING (FINAL FIX)
 # =============================================================================
 @app.route('/api/charging/stop', methods=['POST'])
 @token_required
@@ -468,17 +479,17 @@ def stop_charging():
     warning = None
 
     try:
+        # Для OCPP 2.0.1 (CP002) нам потрібен точний UUID з CitrineOS
         if station_id and ('cp' in station_id.lower() or '002' in station_id):
-            # 1. Отримуємо реальний UUID через GraphQL
+            
+            # 1. Знаходимо реальний UUID транзакції
             real_transaction_id = get_citrine_transaction_id(station_id)
             
             if not real_transaction_id:
-                print("[WARN] Could not find transaction in CitrineDB. Using local fallback.")
+                print("[WARN] Could not find transaction in CitrineDB. Trying local ID.")
                 real_transaction_id = sess.transaction_id 
-            else:
-                print(f"[DEBUG] Found REAL Transaction ID: {real_transaction_id}")
-
-            # 2. Відправляємо запит
+            
+            # 2. Формуємо запит до API CitrineOS
             endpoint = f"{CITRINE_API}/ocpp/2.0.1/evdriver/requestStopTransaction"
             payload = {
                 'stationId': str(station_id),
@@ -495,35 +506,33 @@ def stop_charging():
                 timeout=10
             )
             
+            # 3. Обробка відповіді (List vs Dict fix)
             try:
                 response_json = r.json()
             except:
-                response_json = {} # Якщо відповідь не JSON
+                response_json = {}
 
             print(f"[DEBUG] Citrine Response: {json.dumps(response_json)}")
             
-            # === ВИПРАВЛЕННЯ ТУТ ===
-            # Якщо API повертає список [{}], беремо перший елемент
+            # Витягуємо дані, навіть якщо це список
             response_data = {}
-            if isinstance(response_json, list):
-                if len(response_json) > 0:
-                    response_data = response_json[0]
+            if isinstance(response_json, list) and len(response_json) > 0:
+                response_data = response_json[0]
             elif isinstance(response_json, dict):
                 response_data = response_json
             
-            # Тепер безпечно використовуємо .get() на словнику response_data
+            # Перевіряємо статус
             if r.ok and response_data.get('status') == 'Rejected':
                 warning = f"Station Rejected stop. (Sent ID: {real_transaction_id})"
             elif not r.ok:
                 warning = f"Network error: {r.text}"
 
-    except Exception as e: 
+    except Exception as e:
         import traceback
-        traceback.print_exc() # Друкуємо повний стек помилки в консоль для дебагу
-        print(f"Stop error: {e}")
+        traceback.print_exc()
         warning = str(e)
 
-    # === ЛОКАЛЬНЕ ЗАВЕРШЕННЯ (Примусове) ===
+    # === Завершуємо сесію локально в будь-якому випадку ===
     sess.status = 'completed'
     sess.end_time = datetime.utcnow()
     sess.energy_kwh = round(random.uniform(5.0, 50.0), 2)
