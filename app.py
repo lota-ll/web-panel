@@ -449,7 +449,7 @@ def start_charging():
         return jsonify({'error': str(e)}), 500
 
 # =============================================================================
-# STOP CHARGING (FIXED)
+# STOP CHARGING (FIXED & ROBUST)
 # =============================================================================
 @app.route('/api/charging/stop', methods=['POST'])
 @token_required
@@ -495,15 +495,31 @@ def stop_charging():
                 timeout=10
             )
             
-            response_json = r.json()
+            try:
+                response_json = r.json()
+            except:
+                response_json = {} # Якщо відповідь не JSON
+
             print(f"[DEBUG] Citrine Response: {json.dumps(response_json)}")
             
-            if r.ok and response_json.get('status') == 'Rejected':
+            # === ВИПРАВЛЕННЯ ТУТ ===
+            # Якщо API повертає список [{}], беремо перший елемент
+            response_data = {}
+            if isinstance(response_json, list):
+                if len(response_json) > 0:
+                    response_data = response_json[0]
+            elif isinstance(response_json, dict):
+                response_data = response_json
+            
+            # Тепер безпечно використовуємо .get() на словнику response_data
+            if r.ok and response_data.get('status') == 'Rejected':
                 warning = f"Station Rejected stop. (Sent ID: {real_transaction_id})"
             elif not r.ok:
                 warning = f"Network error: {r.text}"
 
     except Exception as e: 
+        import traceback
+        traceback.print_exc() # Друкуємо повний стек помилки в консоль для дебагу
         print(f"Stop error: {e}")
         warning = str(e)
 
@@ -514,13 +530,13 @@ def stop_charging():
     sess.cost = round(sess.energy_kwh * 4.0, 2)
     db.session.commit()
     
-    response_data = {
+    response_payload = {
         'message': 'Session stopped',
         'session': {'id': sess.id, 'status': 'completed'}
     }
-    if warning: response_data['warning'] = warning
+    if warning: response_payload['warning'] = warning
         
-    return jsonify(response_data)
+    return jsonify(response_payload)
 
 # =============================================================================
 # INIT DB
