@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-EcoCharge Web Portal - CTF Version (FIXED)
+EcoCharge Web Portal - CTF Version (FINAL FIXED)
 """
 
 from flask import Flask, request, jsonify, render_template_string
@@ -28,6 +28,7 @@ db = SQLAlchemy(app)
 # =============================================================================
 
 CITRINE_API = os.environ.get('CITRINE_API', 'http://192.168.20.20:8080')
+CITRINE_GRAPHQL = os.environ.get('CITRINE_GRAPHQL', 'http://192.168.20.20:8090/v1/graphql')
 HASURA_ADMIN_SECRET = 'CitrineOS!'
 JWT_SECRET = 'ecocharge123'
 JWT_ALGORITHM = 'HS256'
@@ -113,7 +114,7 @@ def admin_required(f):
     return decorated
 
 # =============================================================================
-# HTML TEMPLATES (UPDATED CP002 CASE)
+# HTML TEMPLATES
 # =============================================================================
 
 INDEX_HTML = """
@@ -323,11 +324,8 @@ def history():
 def get_citrine_transaction_id(station_id):
     """
     Запитує у CitrineOS через GraphQL реальний transactionId останньої сесії.
-    Це необхідно, бо OCPP 2.0.1 генерує ID асинхронно на стороні станції.
     """
     try:
-        # GraphQL запит до Hasura (бази даних CitrineOS)
-        # Ми шукаємо транзакції для цієї станції, сортуємо за часом (свіжі зверху)
         query = """
         query GetLastTransaction($stationId: String!) {
             transactions(
@@ -343,7 +341,6 @@ def get_citrine_transaction_id(station_id):
             }
         }
         """
-        
         response = requests.post(
             CITRINE_GRAPHQL,
             json={
@@ -353,29 +350,110 @@ def get_citrine_transaction_id(station_id):
             headers={'x-hasura-admin-secret': HASURA_ADMIN_SECRET},
             timeout=5
         )
-        
         data = response.json()
         print(f"[DEBUG] GraphQL Response: {json.dumps(data)}")
-        
-        # Парсимо відповідь
         transactions = data.get('data', {}).get('transactions', [])
         if transactions:
-            tx = transactions[0]
-            # Повертаємо ID, навіть якщо isActive=false (бо може бути затримка статусів)
-            return tx['transactionId']
-            
+            return transactions[0]['transactionId']
     except Exception as e:
         print(f"[ERROR] Failed to fetch transaction ID via GraphQL: {e}")
-    
     return None
 
 # =============================================================================
-# STOP CHARGING (UPDATED)
+# START CHARGING (FIXED)
+# =============================================================================
+@app.route('/api/charging/start', methods=['POST'])
+@token_required
+def start_charging():
+    data = request.json
+    station_id = data.get('station_id')
+    user = User.query.get(request.user_id)
+    
+    try:
+        connector_id = int(data.get('connector_id', 1))
+    except:
+        connector_id = 1
+
+    remote_start_id = random.randint(10000, 99999)
+
+    # === ВИПРАВЛЕННЯ: Створюємо сесію тут, щоб уникнути NameError ===
+    charging_session = ChargingSession(
+        user_id=request.user_id,
+        station_id=station_id,
+        connector_id=connector_id,
+        start_time=datetime.utcnow(),
+        status='pending',
+        transaction_id=str(remote_start_id)
+    )
+    db.session.add(charging_session)
+    db.session.commit()
+    # ================================================================
+
+    try:
+        if station_id and ('cp' in station_id.lower() or '002' in station_id):
+            # === OCPP 2.0.1 (CP002) ===
+            endpoint = f"{CITRINE_API}/ocpp/2.0.1/evdriver/requestStartTransaction"
+            
+            payload = {
+                "stationId": str(station_id),
+                "tenantId": "1",
+                "idToken": {
+                    "idToken": str(user.rfid_token),
+                    "type": "Local"
+                },
+                "evseId": int(connector_id),
+                "remoteStartId": int(remote_start_id)
+            }
+            
+            print(f"[DEBUG] Sending Payload: {json.dumps(payload)}")
+            
+            response = requests.post(
+                endpoint,
+                params={'identifier': station_id},
+                json=payload,
+                timeout=10
+            )
+            
+        else:
+            # === OCPP 1.6 ===
+            endpoint = f"{CITRINE_API}/data/monitoring/remoteStart"
+            response = requests.post(
+                endpoint,
+                json={
+                    'stationId': station_id,
+                    'connectorId': connector_id,
+                    'idTag': user.rfid_token
+                },
+                headers={'x-hasura-admin-secret': HASURA_ADMIN_SECRET},
+                timeout=10
+            )
+
+        if response.ok:
+            charging_session.status = 'active'
+            db.session.commit()
+            return jsonify({
+                'message': 'Charging command sent',
+                'session_id': charging_session.id,
+                'citrine_response': response.json()
+            })
+        else:
+            charging_session.status = 'error'
+            db.session.commit()
+            return jsonify({
+                'message': 'CitrineOS rejected request',
+                'error': response.text
+            }), 400
+            
+    except Exception as e:
+        print(f"[ERROR] {e}")
+        return jsonify({'error': str(e)}), 500
+
+# =============================================================================
+# STOP CHARGING (FIXED)
 # =============================================================================
 @app.route('/api/charging/stop', methods=['POST'])
 @token_required
 def stop_charging():
-    """Stop a charging session"""
     data = request.json
     sid = data.get('session_id')
     station_id = data.get('station_id')
@@ -391,22 +469,20 @@ def stop_charging():
 
     try:
         if station_id and ('cp' in station_id.lower() or '002' in station_id):
-            # 1. СПРОБА ОТРИМАТИ РЕАЛЬНИЙ ID З CITRINEOS
-            # Ми не довіряємо нашому локальному ID, а питаємо у сервера
+            # 1. Отримуємо реальний UUID через GraphQL
             real_transaction_id = get_citrine_transaction_id(station_id)
             
             if not real_transaction_id:
                 print("[WARN] Could not find transaction in CitrineDB. Using local fallback.")
-                real_transaction_id = sess.transaction_id # Fallback
+                real_transaction_id = sess.transaction_id 
             else:
                 print(f"[DEBUG] Found REAL Transaction ID: {real_transaction_id}")
 
-            # 2. ВІДПРАВКА ЗАПИТУ НА ЗУПИНКУ
+            # 2. Відправляємо запит
             endpoint = f"{CITRINE_API}/ocpp/2.0.1/evdriver/requestStopTransaction"
-            
             payload = {
                 'stationId': str(station_id),
-                'transactionId': str(real_transaction_id)  # Використовуємо правильний UUID!
+                'transactionId': str(real_transaction_id)
             }
             
             print(f"[DEBUG] Sending Stop Payload: {json.dumps(payload)}")
@@ -431,7 +507,7 @@ def stop_charging():
         print(f"Stop error: {e}")
         warning = str(e)
 
-    # === ЛОКАЛЬНЕ ЗАВЕРШЕННЯ ===
+    # === ЛОКАЛЬНЕ ЗАВЕРШЕННЯ (Примусове) ===
     sess.status = 'completed'
     sess.end_time = datetime.utcnow()
     sess.energy_kwh = round(random.uniform(5.0, 50.0), 2)
@@ -443,25 +519,6 @@ def stop_charging():
         'session': {'id': sess.id, 'status': 'completed'}
     }
     if warning: response_data['warning'] = warning
-        
-    return jsonify(response_data)
-
-    # Оновлюємо локальну базу тільки якщо немає критичної помилки з'єднання,
-    # АБО якщо ми хочемо "примусово" завершити сесію в UI
-    sess.status = 'completed'
-    sess.end_time = datetime.utcnow()
-    sess.energy_kwh = round(random.uniform(5.0, 50.0), 2) # Імітація
-    db.session.commit()
-    
-    response_data = {
-        'message': 'Session closed locally',
-        'session': {'id': sess.id, 'status': 'completed'}
-    }
-    
-    # Якщо була помилка від Citrine, додаємо її у відповідь
-    if citrine_error:
-        response_data['warning'] = citrine_error
-        # Ми все одно повертаємо 200, щоб UI оновився, але з попередженням
         
     return jsonify(response_data)
 
@@ -478,11 +535,8 @@ def init_db():
             rfid_token='ABC12345'
         )
         db.session.add(admin)
-        
-        # FIX: Ensure DB has uppercase CP002
         if not Station.query.filter_by(station_id='CP002').first():
             db.session.add(Station(station_id='CP002', location='Kyiv Podil', status='online'))
-            
         db.session.commit()
         print("[+] Database Initialized.")
 
