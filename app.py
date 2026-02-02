@@ -554,7 +554,7 @@ def start_charging():
     # 1. ОТРИМАННЯ ДАНИХ
     user = User.query.get(request.user_id)
     
-    # Гарантуємо, що це ціле число (int), а не рядок
+    # Гарантуємо, що це ціле число (int)
     try:
         connector_id = int(data.get('connector_id', 1))
     except:
@@ -563,23 +563,34 @@ def start_charging():
     # Генеруємо ID транзакції як число
     remote_start_id = random.randint(10000, 99999)
 
-    # ... (збереження в БД пропустимо для скорочення) ...
+    # --- ВИПРАВЛЕННЯ: СТВОРЮЄМО СЕСІЮ В БД ПЕРЕД ЗАПИТОМ ---
+    charging_session = ChargingSession(
+        user_id=request.user_id,
+        station_id=station_id,
+        connector_id=connector_id,
+        start_time=datetime.utcnow(),
+        status='pending',
+        transaction_id=str(remote_start_id)
+    )
+    db.session.add(charging_session)
+    db.session.commit()
+    # -------------------------------------------------------
 
     try:
         if station_id.startswith('cp') or '002' in station_id:
             # === OCPP 2.0.1 (CP002) ===
             endpoint = f"{CITRINE_API}/ocpp/2.0.1/evdriver/requestStartTransaction"
             
-            # 2. ФОРМУВАННЯ PAYLOAD (Точна копія твого CURL)
+            # 2. ФОРМУВАННЯ PAYLOAD
             payload = {
-                "stationId": str(station_id),      # String
-                "tenantId": "1",                   # String
+                "stationId": str(station_id),
+                "tenantId": "1",
                 "idToken": {
-                    "idToken": str(user.rfid_token), # String ("ABC12345")
-                    "type": "Local"                  # String
+                    "idToken": str(user.rfid_token),
+                    "type": "Local"
                 },
-                "evseId": int(connector_id),       # Integer (1) - ВАЖЛИВО!
-                "remoteStartId": int(remote_start_id) # Integer (12345) - ВАЖЛИВО!
+                "evseId": int(connector_id),
+                "remoteStartId": int(remote_start_id)
             }
             
             print(f"[DEBUG] Sending Payload: {json.dumps(payload)}")
@@ -587,13 +598,13 @@ def start_charging():
             # 3. ВІДПРАВКА
             response = requests.post(
                 endpoint,
-                params={'identifier': station_id}, # Додає ?identifier=CP002
-                json=payload,                      # Автоматично ставить Content-Type: application/json
+                params={'identifier': station_id}, # Query param required for Citrine
+                json=payload,
                 timeout=10
             )
             
         else:
-            # Fallback for OCPP 1.6 (Old logic)
+            # Fallback for OCPP 1.6
             endpoint = f"{CITRINE_API}/data/monitoring/remoteStart"
             response = requests.post(
                 endpoint,
@@ -607,6 +618,7 @@ def start_charging():
             )
 
         if response.ok:
+            # Тепер ця змінна існує, і помилки не буде
             charging_session.status = 'active'
             db.session.commit()
             return jsonify({
@@ -615,7 +627,6 @@ def start_charging():
                 'citrine_response': response.json()
             })
         else:
-             # Log error but keep session for debug
             charging_session.status = 'error'
             db.session.commit()
             return jsonify({
@@ -624,6 +635,7 @@ def start_charging():
             }), 400
             
     except Exception as e:
+        print(f"[ERROR] {e}")
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/charging/stop', methods=['POST'])
