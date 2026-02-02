@@ -263,9 +263,23 @@ DASHBOARD_HTML = """
                     body: JSON.stringify({session_id: sessionId, station_id: stationId})
                 });
                 const data = await res.json();
+                
                 log.innerText = JSON.stringify(data, null, 2);
-                if(res.ok) { loadData(); alert("Stopped!"); }
-            } catch(e) { log.innerText = e; }
+                
+                if(res.ok) {
+                    if (data.warning) {
+                        alert("Session closed locally, BUT remote error: " + data.warning);
+                    } else {
+                        alert("Charging stopped successfully!");
+                    }
+                    loadData(); 
+                } else {
+                    alert("Error: " + data.error);
+                }
+            } catch(e) { 
+                log.innerText = "JS Error: " + e; 
+                alert("JS Error: " + e);
+            }
         }
 
         loadData();
@@ -392,37 +406,69 @@ def start_charging():
 @app.route('/api/charging/stop', methods=['POST'])
 @token_required
 def stop_charging():
+    """Stop a charging session"""
     data = request.json
     sid = data.get('session_id')
     station_id = data.get('station_id')
     
     sess = ChargingSession.query.get(sid)
     if not sess: return jsonify({'error': 'Session not found'}), 404
+    
+    # Check permissions
+    if sess.user_id != request.user_id and request.user_role != 'admin':
+        return jsonify({'error': 'Not authorized'}), 403
 
     print(f"\n[DEBUG] Stopping session {sid} on {station_id}")
+    citrine_error = None
 
     try:
-        # OCPP 2.0.1 Stop
+        # OCPP 2.0.1 Stop for CP002
         if station_id and ('cp' in station_id.lower() or '002' in station_id):
             endpoint = f"{CITRINE_API}/ocpp/2.0.1/evdriver/requestStopTransaction"
+            
+            # ВАЖЛИВО: Ми намагаємось використати збережений ID.
+            # Якщо станція використовує свій лічильник (1, 2, 3...), це може не спрацювати без вебхуків.
             payload = {
-                'stationId': station_id,
-                'transactionId': sess.transaction_id or "12345"
+                'stationId': str(station_id),
+                'transactionId': str(sess.transaction_id) 
             }
+            
+            print(f"[DEBUG] Sending Stop Payload: {json.dumps(payload)}")
+            
             r = requests.post(
                 endpoint,
                 params={'identifier': station_id},
                 json=payload,
-                headers={'Content-Type': 'application/json'}
+                headers={'Content-Type': 'application/json'},
+                timeout=10
             )
-            print(f"[DEBUG] Stop response: {r.text}")
+            print(f"[DEBUG] Stop response: {r.status_code} - {r.text}")
             
-    except Exception as e: print(f"Stop error: {e}")
+            if not r.ok:
+                citrine_error = f"Citrine Error: {r.text}"
 
+    except Exception as e: 
+        print(f"Stop error: {e}")
+        citrine_error = str(e)
+
+    # Оновлюємо локальну базу тільки якщо немає критичної помилки з'єднання,
+    # АБО якщо ми хочемо "примусово" завершити сесію в UI
     sess.status = 'completed'
     sess.end_time = datetime.utcnow()
+    sess.energy_kwh = round(random.uniform(5.0, 50.0), 2) # Імітація
     db.session.commit()
-    return jsonify({'message': 'Stopped'})
+    
+    response_data = {
+        'message': 'Session closed locally',
+        'session': {'id': sess.id, 'status': 'completed'}
+    }
+    
+    # Якщо була помилка від Citrine, додаємо її у відповідь
+    if citrine_error:
+        response_data['warning'] = citrine_error
+        # Ми все одно повертаємо 200, щоб UI оновився, але з попередженням
+        
+    return jsonify(response_data)
 
 # =============================================================================
 # INIT DB
